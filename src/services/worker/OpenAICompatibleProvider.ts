@@ -64,6 +64,21 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
    * preserves that per-provider divergence.
    */
   protected abstract readonly forwardEmptyMessageResponse: boolean;
+  /**
+   * Whether the init/continuation brief is also sent as its own standalone
+   * query before the message loop starts.
+   *
+   * True for the HTTP chat providers, where that call primes a conversation
+   * the observation calls then build on. False for a stateless transport that
+   * re-sends the whole history on every call (codex): there the extra call
+   * buys nothing and is actively harmful, because the brief asks for nothing
+   * actionable — it is answered with an empty message (logged as an init
+   * failure) or, worse, with an observation fabricated from `<user_request>`
+   * alone that is stored as if the work had happened. The brief is pushed onto
+   * the history either way, so the first observation call carries the same
+   * context regardless.
+   */
+  protected readonly primesConversation: boolean = true;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
@@ -139,22 +154,24 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
 
     session.conversationHistory.push({ role: 'user', content: initPrompt });
 
-    try {
-      session.lastPromptSentAt = Date.now();
-      session.lastGeneratorSource = 'init';
-      const initResponse = await this.query(session.conversationHistory, config);
-      await this.handleInitResponse(initResponse, session, worker, model, initContext);
-    } catch (error: unknown) {
-      // Classified errors are logged once, at SessionRoutes' `Observer failed`
-      // line; here they're debug-level so one failure isn't five error lines.
-      if (isClassified(error)) {
-        logger.debug('SDK', `${this.providerName} init query failed`, { sessionId: session.sessionDbId, model, kind: error.kind }, error);
-      } else if (error instanceof Error) {
-        logger.error('SDK', `${this.providerName} init query failed`, { sessionId: session.sessionDbId, model }, error);
-      } else {
-        logger.error('SDK', `${this.providerName} init query failed with non-Error`, { sessionId: session.sessionDbId, model }, new Error(String(error)));
+    if (this.primesConversation) {
+      try {
+        session.lastPromptSentAt = Date.now();
+        session.lastGeneratorSource = 'init';
+        const initResponse = await this.query(session.conversationHistory, config);
+        await this.handleInitResponse(initResponse, session, worker, model, initContext);
+      } catch (error: unknown) {
+        // Classified errors are logged once, at SessionRoutes' `Observer failed`
+        // line; here they're debug-level so one failure isn't five error lines.
+        if (isClassified(error)) {
+          logger.debug('SDK', `${this.providerName} init query failed`, { sessionId: session.sessionDbId, model, kind: error.kind }, error);
+        } else if (error instanceof Error) {
+          logger.error('SDK', `${this.providerName} init query failed`, { sessionId: session.sessionDbId, model }, error);
+        } else {
+          logger.error('SDK', `${this.providerName} init query failed with non-Error`, { sessionId: session.sessionDbId, model }, new Error(String(error)));
+        }
+        return this.handleSessionError(error, session, worker);
       }
-      return this.handleSessionError(error, session, worker);
     }
 
     try {

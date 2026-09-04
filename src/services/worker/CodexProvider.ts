@@ -197,13 +197,14 @@ export function codexExitMessage(
  *    ladder and its WebSocket-to-HTTPS transport fallback MID-TURN. Measured:
  *    five `Reconnecting... N/5` events on a turn that went on to emit its
  *    agent_message and exit 0. Recovering after a blip is the designed path,
- *    so treating it as fatal turns a success into a failure — and because
- *    forwardEmptyMessageResponse is false, leaves the batch queued.
+ *    so treating it as fatal turns a success into a failure.
  *
- * Only `turn.failed` is a real failure.
+ * `turn.failed` is one real failure; the other is a clean exit that carried NO
+ * `agent_message` at all (see the throw below).
  */
 export function parseCodexJsonl(stdout: string): ProviderQueryResult {
   let content = '';
+  let sawAgentMessage = false;
   let usage: CodexUsage | undefined;
 
   for (const event of parseCodexEvents(stdout)) {
@@ -211,6 +212,7 @@ export function parseCodexJsonl(stdout: string): ProviderQueryResult {
       if (event.item?.type === 'agent_message' && typeof event.item.text === 'string') {
         // Last one wins: a turn may emit several messages, the final is the answer.
         content = event.item.text;
+        sawAgentMessage = true;
       } else if (event.item?.type === 'error') {
         logger.debug('SDK', 'Codex reported a non-fatal error item', {
           message: event.item.message,
@@ -234,6 +236,19 @@ export function parseCodexJsonl(stdout: string): ProviderQueryResult {
     if (event.type === 'turn.failed') {
       throw classifyCodexError(codexEventMessage(event));
     }
+  }
+
+  if (!sawAgentMessage) {
+    // An EMPTY agent_message is a verdict — "nothing here to record" — and is
+    // forwarded as one (see forwardEmptyMessageResponse). NO agent_message is
+    // not a verdict: codex ended the turn without answering. Classified
+    // transient, withRetry spends its one attempt and, if that fails too, the
+    // claimed batch is left for the next generator pass instead of being
+    // drained as a skip nobody made.
+    throw new ClassifiedProviderError('codex exec completed without an agent_message', {
+      kind: 'transient',
+      cause: new Error('no agent_message item in the codex event stream'),
+    });
   }
 
   return {
@@ -429,9 +444,29 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
   // telemetry provider enum.
   protected readonly providerName = 'Codex';
   protected readonly syntheticIdPrefix = 'codex';
-  // Mirrors Gemini: empty output leaves the batch queued rather than
-  // forwarding an empty response to the parser.
-  protected readonly forwardEmptyMessageResponse = false;
+  /**
+   * An empty codex reply is the model's ANSWER, not a missing one: the skip
+   * guidance carried in every observation prompt says "return an empty
+   * response only", and a measured empty run emits an `agent_message` item and
+   * spends reasoning tokens on it. A stream with no `agent_message` at all
+   * never reaches here — parseCodexJsonl raises it as transient — so empty
+   * content is always a deliberate skip.
+   *
+   * Forwarding it lets processAgentResponse classify the reply as idle and
+   * confirm the batch, the same end state as <skip_summary/>. With Gemini's
+   * `false` the claimed batch was neither confirmed nor reset: it sat in the
+   * in-RAM buffer until deleteSession dropped it on the idle teardown — no
+   * row, no retry, no trace beyond one WARN.
+   */
+  protected readonly forwardEmptyMessageResponse = true;
+  /**
+   * `codex exec` has no conversation API — flattenHistory re-sends every turn
+   * on every call — so priming it with the init brief buys no context. It only
+   * pays ~18 k input tokens and ~6 s for a reply that is either empty (logged
+   * as an init failure) or an observation fabricated from `<user_request>`
+   * alone and stored as if the work had happened.
+   */
+  protected readonly primesConversation = false;
 
   protected getConfig(): CodexConfig {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
@@ -558,7 +593,17 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
           }
 
           try {
-            resolve(parseCodexJsonl(stdout));
+            const result = parseCodexJsonl(stdout);
+            // The line that settles the next "why was this reply empty?": with
+            // the no-agent_message floor above, contentChars=0 here can only
+            // mean codex deliberately answered with an empty message.
+            logger.debug('SDK', 'codex exec finished', {
+              promptChars: prompt.length,
+              contentChars: result.content.length,
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+            });
+            resolve(result);
           } catch (parseError: unknown) {
             reject(parseError);
           }

@@ -1,12 +1,20 @@
-import { describe, it, expect } from 'bun:test';
+import { afterEach, beforeEach, describe, it, expect, mock, spyOn } from 'bun:test';
 import {
   classifyCodexError,
   codexExitMessage,
   codexFailureMessage,
+  CodexProvider,
   flattenHistory,
   parseCodexJsonl,
+  type CodexConfig,
 } from '../../src/services/worker/CodexProvider.js';
 import { isClassified } from '../../src/services/worker/provider-errors.js';
+import type { ProviderQueryResult } from '../../src/services/worker/OpenAICompatibleProvider.js';
+import { ModeManager } from '../../src/services/domain/ModeManager.js';
+import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
+import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
+import { SessionManager } from '../../src/services/worker/SessionManager.js';
+import type { ActiveSession, ConversationMessage } from '../../src/services/worker-types.js';
 
 // The success fixture is the real event stream of a `codex exec --json` run,
 // including the NON-FATAL warning codex emits as an `item.completed` whose
@@ -28,8 +36,7 @@ const CODEX_SUCCESS_JSONL = [
  * ladder, fell back to HTTPS, hit one more stream drop — and then finished the
  * turn and EXITED 0. Every `Reconnecting...` line here is a TOP-LEVEL
  * `{"type":"error"}` event: the second, non-obvious floor of the non-fatal-error
- * trap. Treating them as fatal turns this success into a failure and, because
- * forwardEmptyMessageResponse is false, leaves the observation batch queued.
+ * trap. Treating them as fatal turns this success into a failure.
  */
 const CODEX_RECONNECT_RECOVERY_JSONL = [
   '{"type":"thread.started","thread_id":"01a06d36-a77f-7821-89d2-980aac29de3e"}',
@@ -264,5 +271,170 @@ describe('flattenHistory', () => {
     expect(flattened.startsWith('Below is a memory-extraction conversation.')).toBe(true);
     expect(flattened).toContain('### ASSISTANT\nprior observation');
     expect(flattened.endsWith('### USER\nanswer this one')).toBe(true);
+  });
+});
+
+/**
+ * Verbatim stdout of a real init-brief run (codex-cli 0.153.1, gpt-5.4-mini):
+ * an `agent_message` whose text is EMPTY, after 124 reasoning tokens. That is
+ * codex answering "nothing to record" — the shape the brief provokes, because
+ * the brief carries the skip guidance ("return an empty response only") and no
+ * tool call to record. Measured on 10 of 12 session starts.
+ */
+const CODEX_EMPTY_ANSWER_JSONL = [
+  '{"type":"thread.started","thread_id":"01a06d83-aae3-7cd3-8601-ce37807dc4c5"}',
+  '{"type":"turn.started"}',
+  '{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Skill descriptions were shortened to fit the skills context budget."}}',
+  '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":""}}',
+  '{"type":"turn.completed","usage":{"input_tokens":18341,"cached_input_tokens":15616,"cache_write_input_tokens":0,"output_tokens":130,"reasoning_output_tokens":124}}',
+  '',
+].join('\n');
+
+/** The same turn with no `agent_message` at all: codex said nothing, not "nothing". */
+const CODEX_NO_ANSWER_JSONL = [
+  '{"type":"thread.started","thread_id":"01a06d83-aae3-7cd3-8601-ce37807dc4c5"}',
+  '{"type":"turn.started"}',
+  '{"type":"turn.completed","usage":{"input_tokens":18341,"output_tokens":0}}',
+  '',
+].join('\n');
+
+const mockMode = {
+  name: 'code',
+  prompts: { init: 'init', observation: 'obs', summary: 'summary' },
+  observation_types: [{ id: 'discovery' }],
+  observation_concepts: [],
+};
+
+/**
+ * CodexProvider with only the codex child replaced: getConfig skips the binary
+ * lookup and query records the flattened-history input it was handed. The
+ * session lifecycle under test (init handling, message loop, empty-response
+ * routing) is the real one.
+ */
+class StubbedCodexProvider extends CodexProvider {
+  readonly sentHistories: ConversationMessage[][] = [];
+
+  constructor(
+    sessionManager: SessionManager,
+    private readonly replies: string[],
+  ) {
+    super({} as unknown as DatabaseManager, sessionManager);
+  }
+
+  protected getConfig(): CodexConfig {
+    return { apiKey: '/usr/bin/true', model: 'gpt-5.4-mini', reasoningEffort: 'low' };
+  }
+
+  protected async query(history: ConversationMessage[]): Promise<ProviderQueryResult> {
+    this.sentHistories.push(history.map((message) => ({ ...message })));
+    return { content: this.replies.shift() ?? '' };
+  }
+}
+
+function makeSession(): ActiveSession {
+  return {
+    sessionDbId: 1,
+    contentSessionId: 'codex-session',
+    memorySessionId: 'codex-session-123',
+    project: 'ws',
+    platformSource: 'claude',
+    userPrompt: 'Ajoute un provider codex a claude-mem',
+    abortController: new AbortController(),
+    generatorPromise: null,
+    lastPromptNumber: 1,
+    startTime: Date.now(),
+    cumulativeInputTokens: 0,
+    cumulativeOutputTokens: 0,
+    earliestPendingTimestamp: null,
+    claimedMessageIds: [],
+    conversationHistory: [],
+    currentProvider: null,
+    consecutiveRestarts: 0,
+    consecutiveInvalidOutputs: 0,
+    lastGeneratorActivity: Date.now(),
+  };
+}
+
+/**
+ * The mechanism guard for the two codex empty-response defects. Both are
+ * asserted through the real startSession path, so they go red if the flags are
+ * flipped back OR if the base class stops honoring them.
+ *
+ * 1. The init brief must not be sent as its own query. It asks for nothing
+ *    actionable, so codex answers it with an empty message (10 of 12 measured
+ *    session starts, one ERROR line each) or — twice in 12 — with an
+ *    observation fabricated from `<user_request>` alone, which was then stored
+ *    as if the work had happened.
+ * 2. An empty observation reply must drain its batch. It is a skip verdict, and
+ *    the in-RAM buffer has no durable queue behind it: a batch left claimed is
+ *    destroyed by the idle teardown, storing nothing and logging nothing but a
+ *    single WARN.
+ */
+describe('CodexProvider empty-response handling', () => {
+  let modeManagerSpy: ReturnType<typeof spyOn>;
+  let settingsSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    modeManagerSpy = spyOn(ModeManager, 'getInstance').mockImplementation(() => ({
+      getActiveMode: () => mockMode,
+      loadMode: () => {},
+    } as unknown as ModeManager));
+    settingsSpy = spyOn(SettingsDefaultsManager, 'loadFromFile').mockImplementation(
+      () => SettingsDefaultsManager.getAllDefaults(),
+    );
+  });
+
+  afterEach(() => {
+    modeManagerSpy.mockRestore();
+    settingsSpy.mockRestore();
+    mock.restore();
+  });
+
+  function sessionManagerDouble(): { manager: SessionManager; confirmed: ReturnType<typeof mock> } {
+    const confirmed = mock(() => Promise.resolve(1));
+    const manager = {
+      getMessageIterator: async function* () {
+        yield { type: 'observation', tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: { stdout: '' }, prompt_number: 1 };
+      },
+      confirmClaimedMessages: confirmed,
+      resetProcessingToPending: mock(() => Promise.resolve(0)),
+    } as unknown as SessionManager;
+    return { manager, confirmed };
+  }
+
+  it('sends one query per observation and never a standalone init query', async () => {
+    const { manager } = sessionManagerDouble();
+    const provider = new StubbedCodexProvider(manager, ['']);
+
+    await provider.startSession(makeSession());
+
+    expect(provider.sentHistories.length).toBe(1);
+    expect(provider.sentHistories[0].map((message) => message.role)).toEqual(['user', 'user']);
+    expect(provider.sentHistories[0][0].content).toContain('<user_request>');
+    expect(provider.sentHistories[0][1].content).toContain('<observed_from_primary_session>');
+  });
+
+  it('drains the claimed batch when codex answers an observation with an empty message', async () => {
+    const { manager, confirmed } = sessionManagerDouble();
+    const provider = new StubbedCodexProvider(manager, ['']);
+
+    await provider.startSession(makeSession());
+
+    expect(confirmed).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads an empty agent_message as empty content, not as a failure', () => {
+    expect(parseCodexJsonl(CODEX_EMPTY_ANSWER_JSONL).content).toBe('');
+  });
+
+  it('raises a transient failure when a clean turn carried no agent_message at all', () => {
+    let thrown: unknown;
+    try {
+      parseCodexJsonl(CODEX_NO_ANSWER_JSONL);
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(isClassified(thrown)).toBe(true);
+    expect(isClassified(thrown) ? thrown.kind : undefined).toBe('transient');
   });
 });
