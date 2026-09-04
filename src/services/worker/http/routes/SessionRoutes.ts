@@ -8,6 +8,7 @@ import { stripMemoryTags, isInternalProtocolPayload } from '../../../../utils/ta
 import { SessionManager } from '../../SessionManager.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { ClaudeProvider } from '../../ClaudeProvider.js';
+import { CodexProvider, isCodexAvailable } from '../../CodexProvider.js';
 import { GeminiProvider } from '../../GeminiProvider.js';
 import { OpenRouterProvider } from '../../OpenRouterProvider.js';
 import { getSelectedProvider, recordCmemFallbackIfEligible, releaseCmemGatewayProbe, selectProviderForGenerator } from '../../provider-dispatch.js';
@@ -28,6 +29,7 @@ import {
   getDependencyStatus,
   isDependencyStatusInCooldown,
   recordClaudeCliSetupRequired,
+  recordCodexCliSetupRequired,
 } from '../../../../shared/dependency-health.js';
 import { findClaudeExecutable } from '../../../../shared/find-claude-executable.js';
 import { recordObserverFailure } from '../../../../shared/observer-health.js';
@@ -68,6 +70,7 @@ export class SessionRoutes extends BaseRouteHandler {
     private sdkAgent: ClaudeProvider,
     private geminiAgent: GeminiProvider,
     private openRouterAgent: OpenRouterProvider,
+    private codexAgent: CodexProvider,
     private eventBroadcaster: SessionEventBroadcaster,
     private workerService: WorkerService,
     private completionHandler: SessionCompletionHandler,
@@ -143,6 +146,41 @@ export class SessionRoutes extends BaseRouteHandler {
             return;
           }
         }
+      } else if (selectedProvider === 'codex') {
+        const codexStatus = getDependencyStatus('codex_cli');
+        if (codexStatus?.kind === 'setup_required') {
+          if (isDependencyStatusInCooldown(codexStatus, CLAUDE_CLI_SETUP_RECHECK_COOLDOWN_MS)) {
+            logger.warn('SESSION', 'Skipping Codex generator start until setup is repaired', {
+              sessionId: sessionDbId,
+              source,
+              dependency: codexStatus.dependency,
+              status: codexStatus.kind,
+              message: codexStatus.message,
+            });
+            releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+            return;
+          }
+
+          // isCodexAvailable() IS the re-probe: resolving the binary is the
+          // whole check, so there is nothing heavier to run here.
+          if (!isCodexAvailable()) {
+            // Re-arm the cooldown, or every later ingest would re-probe.
+            recordCodexCliSetupRequired(codexStatus.message);
+            logger.warn('SESSION', 'Codex setup dependency still unavailable after cooldown', {
+              sessionId: sessionDbId,
+              source,
+              message: codexStatus.message,
+            });
+            releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+            return;
+          }
+
+          clearDependencyStatus('codex_cli');
+          logger.info('SESSION', 'Codex setup dependency repaired; resuming generator start', {
+            sessionId: sessionDbId,
+            source,
+          });
+        }
       }
       // Quota breaker (#3634). Without this, an exhausted allowance produced one
       // doomed request per captured tool call for the rest of the billing cycle:
@@ -197,7 +235,7 @@ export class SessionRoutes extends BaseRouteHandler {
 
   private async startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter',
+    provider: 'claude' | 'codex' | 'gemini' | 'openrouter',
     source: string,
     /** The quota probe this run claimed, or null when it was admitted without one. */
     quotaProbeClaimId: number | null,
@@ -213,8 +251,12 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
     }
 
-    const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
-    const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
+    const agent = provider === 'openrouter'
+      ? this.openRouterAgent
+      : provider === 'gemini' ? this.geminiAgent : (provider === 'codex' ? this.codexAgent : this.sdkAgent);
+    const agentName = provider === 'openrouter'
+      ? 'OpenRouter'
+      : provider === 'gemini' ? 'Gemini' : (provider === 'codex' ? 'Codex' : 'Claude SDK');
 
     const actualQueueDepth = this.sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId);
 
@@ -243,10 +285,14 @@ export class SessionRoutes extends BaseRouteHandler {
         }
 
         const errorMsg = error instanceof Error ? error.message : String(error);
-        if (provider === 'claude' && isClassified(error) && error.kind === 'setup_required') {
+        if ((provider === 'claude' || provider === 'codex') && isClassified(error) && error.kind === 'setup_required') {
           skipGeneratorExitFinalization = true;
-          recordClaudeCliSetupRequired(error.message);
-          logger.warn('SESSION', 'Claude generator start requires setup; future Claude starts will be skipped until repaired', {
+          if (provider === 'codex') {
+            recordCodexCliSetupRequired(error.message);
+          } else {
+            recordClaudeCliSetupRequired(error.message);
+          }
+          logger.warn('SESSION', `${agentName} generator start requires setup; future starts on this provider will be skipped until repaired`, {
             sessionId: session.sessionDbId,
             provider,
             error: error.message,

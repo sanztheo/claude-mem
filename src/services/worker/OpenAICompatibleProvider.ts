@@ -86,7 +86,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
    * `session.conversationHistory` would grow the very conversation the recycle
    * logic exists to bound.
    */
-  private async compressField(text: string, budgetChars: number, config: TConfig): Promise<string | null> {
+  protected async compressField(text: string, budgetChars: number, config: TConfig): Promise<string | null> {
     const result = await this.query(
       [{ role: 'user', content: buildFieldCompressionPrompt(text, budgetChars) }],
       config,

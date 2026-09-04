@@ -6,9 +6,12 @@ import { findClaudeExecutable as defaultFindClaudeExecutable } from '../../share
 import { getUvxBinDirs } from '../../shared/uvx-bin-dirs.js';
 import { stripForeignPythonEnv } from '../../shared/uvx-env.js';
 import { logger } from '../../utils/logger.js';
+import { isCodexAvailable as defaultIsCodexAvailable } from './CodexProvider.js';
 import {
   clearDependencyStatus,
+  CODEX_CLI_SETUP_REMEDIATION,
   recordClaudeCliSetupRequired,
+  recordCodexCliSetupRequired,
   recordUvxVectorSearchUnavailable,
   snapshotDependencyHealth,
   type DependencyHealthSnapshot,
@@ -28,6 +31,9 @@ export interface WorkerDependencyPreflightOptions {
   settings: DependencyPreflightSettings;
   classifyClaudeError: (error: unknown) => ClassifiedClaudeSetupError;
   findClaudeExecutable?: () => string;
+  /** Same injection seam as findClaudeExecutable, so a codex preflight test
+   *  does not depend on whether the developer's machine has codex installed. */
+  isCodexAvailable?: () => boolean;
   env?: Record<string, string | undefined>;
   platform?: NodeJS.Platform;
   homedir?: () => string;
@@ -180,6 +186,18 @@ export function runWorkerDependencyPreflight(options: WorkerDependencyPreflightO
     }
   } else {
     clearDependencyStatus('claude_cli');
+  }
+
+  if (provider === 'codex') {
+    const isCodexInstalled = options.isCodexAvailable ?? defaultIsCodexAvailable;
+    if (isCodexInstalled()) {
+      clearDependencyStatus('codex_cli');
+    } else {
+      logger.warn('WORKER', 'codex executable not found during worker dependency preflight');
+      recordCodexCliSetupRequired(`codex CLI not found. ${CODEX_CLI_SETUP_REMEDIATION}`);
+    }
+  } else {
+    clearDependencyStatus('codex_cli');
   }
 
   if (chromaEnabled) {

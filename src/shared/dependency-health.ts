@@ -2,7 +2,7 @@ export type DependencyStatusKind =
   | 'setup_required'
   | 'vector_search_unavailable';
 
-export type DependencyName = 'claude_cli' | 'uvx' | 'chroma';
+export type DependencyName = 'claude_cli' | 'codex_cli' | 'uvx' | 'chroma';
 
 export interface DependencyStatus {
   dependency: DependencyName;
@@ -17,6 +17,10 @@ export const CLAUDE_CLI_SETUP_RECHECK_COOLDOWN_MS = 30_000;
 export const CLAUDE_CLI_SETUP_REMEDIATION =
   'Install or update Claude Code CLI, then restart claude-mem. Try `claude update`, ' +
   '`npm install -g @anthropic-ai/claude-code@latest`, or set CLAUDE_CODE_PATH in ~/.claude-mem/settings.json.';
+
+export const CODEX_CLI_SETUP_REMEDIATION =
+  'Install the Codex CLI and run `codex login`, then restart claude-mem. ' +
+  'Or set CLAUDE_MEM_CODEX_PATH in ~/.claude-mem/settings.json.';
 
 export const UVX_VECTOR_SEARCH_REMEDIATION =
   'Install uv/uvx and make uvx visible to the worker PATH, then restart claude-mem. ' +
@@ -52,6 +56,10 @@ export function recordDependencyStatus(
 
 export function recordClaudeCliSetupRequired(message: string): DependencyStatus {
   return recordDependencyStatus('claude_cli', 'setup_required', message, CLAUDE_CLI_SETUP_REMEDIATION);
+}
+
+export function recordCodexCliSetupRequired(message: string): DependencyStatus {
+  return recordDependencyStatus('codex_cli', 'setup_required', message, CODEX_CLI_SETUP_REMEDIATION);
 }
 
 export function recordUvxVectorSearchUnavailable(message: string): DependencyStatus {

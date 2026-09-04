@@ -3,7 +3,8 @@
  * and worker-service (getAiStatus) — previously duplicated in both.
  *
  * Semantics: openrouter wins when selected AND a key exists; else gemini when
- * selected AND a key exists; else claude (silent fall-through, unchanged).
+ * selected AND a key exists; else codex when selected AND the codex CLI is on
+ * PATH; else claude (silent fall-through, unchanged).
  *
  * Trial-expiry fallback (plan 2026-08-26 Phase 6): when the selected
  * openrouter config points at the cmem.ai gateway AND a terminal quota/key
@@ -18,6 +19,7 @@ import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js
 import { paths } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { isCmemGatewayUrl, writeProFallbackAt } from '../../shared/cmem-gateway.js';
+import { isCodexAvailable, isCodexSelected } from './CodexProvider.js';
 import { isGeminiAvailable, isGeminiSelected } from './GeminiProvider.js';
 import { isOpenRouterAvailable, isOpenRouterSelected } from './OpenRouterProvider.js';
 import type { ClassifiedProviderError } from './provider-errors.js';
@@ -44,7 +46,7 @@ export function shouldUseCmemFallback(
  * handed back to `releaseCmemGatewayProbe` when that run ends.
  */
 export interface ProviderSelection {
-  provider: 'claude' | 'gemini' | 'openrouter';
+  provider: 'claude' | 'codex' | 'gemini' | 'openrouter';
   gatewayProbeClaimId: number | null;
 }
 
@@ -53,7 +55,7 @@ export interface ProviderSelection {
  * is safe to call from anywhere — but a caller about to actually SEND must use
  * `selectProviderForGenerator` instead, or it becomes part of the herd.
  */
-export function getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
+export function getSelectedProvider(): 'claude' | 'codex' | 'gemini' | 'openrouter' {
   if (isOpenRouterSelected() && isOpenRouterAvailable()) {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     if (
@@ -65,7 +67,17 @@ export function getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
     }
     return 'openrouter';
   }
-  return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
+  return selectLocalProvider();
+}
+
+/**
+ * The gemini → codex → claude tail of the dispatch rule, shared by both
+ * entry points so they can never disagree about it.
+ */
+function selectLocalProvider(): 'claude' | 'codex' | 'gemini' {
+  if (isGeminiSelected() && isGeminiAvailable()) return 'gemini';
+  if (isCodexSelected() && isCodexAvailable()) return 'codex';
+  return 'claude';
 }
 
 /**
@@ -105,7 +117,7 @@ export function selectProviderForGenerator(): ProviderSelection {
     return { provider: 'openrouter', gatewayProbeClaimId: null };
   }
   return {
-    provider: (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude',
+    provider: selectLocalProvider(),
     gatewayProbeClaimId: null,
   };
 }

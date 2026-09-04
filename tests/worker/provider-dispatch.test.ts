@@ -1,12 +1,13 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, readFileSync, rmSync } from 'fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   CMEM_FALLBACK_RETRY_MS,
   getSelectedProvider,
   recordCmemFallbackIfEligible,
+  selectProviderForGenerator,
   shouldUseCmemFallback,
 } from '../../src/services/worker/provider-dispatch.js';
 import { classifyOpenRouterError } from '../../src/services/worker/OpenRouterProvider.js';
@@ -26,7 +27,9 @@ const ENV_KEYS = [
   'CLAUDE_MEM_OPENROUTER_BASE_URL',
   'CLAUDE_MEM_PRO_FALLBACK_AT',
   'CLAUDE_MEM_GEMINI_API_KEY',
+  'CLAUDE_MEM_CODEX_PATH',
   'CMEM_PRO_ORIGIN',
+  'PATH',
 ] as const;
 
 describe('provider-dispatch', () => {
@@ -107,6 +110,55 @@ describe('provider-dispatch', () => {
       process.env.CLAUDE_MEM_GEMINI_API_KEY = '';
       process.env.CLAUDE_MEM_OPENROUTER_API_KEY = '';
       expect(getSelectedProvider()).toBe('claude');
+    });
+
+    // The codex leg of the rule. Both entry points share selectLocalProvider,
+    // so a regression here is the silent fall-through to claude: memory keeps
+    // generating on the Anthropic plan and nothing says the codex selection
+    // was ignored.
+    it('returns codex when codex is selected and the CLI resolves', () => {
+      process.env.CLAUDE_MEM_PROVIDER = 'codex';
+      process.env.CLAUDE_MEM_OPENROUTER_API_KEY = '';
+      process.env.CLAUDE_MEM_GEMINI_API_KEY = '';
+      // An override that exists is all resolveCodexBinary needs; process.execPath
+      // is the one guaranteed-present executable on any machine running this.
+      process.env.CLAUDE_MEM_CODEX_PATH = process.execPath;
+
+      expect(getSelectedProvider()).toBe('codex');
+      expect(selectProviderForGenerator()).toEqual({ provider: 'codex', gatewayProbeClaimId: null });
+    });
+
+    it('falls through to claude when codex is selected but the CLI is absent', () => {
+      process.env.CLAUDE_MEM_PROVIDER = 'codex';
+      process.env.CLAUDE_MEM_OPENROUTER_API_KEY = '';
+      process.env.CLAUDE_MEM_GEMINI_API_KEY = '';
+      process.env.CLAUDE_MEM_CODEX_PATH = join(tmpdir(), 'claude-mem-no-such-codex-binary');
+      // Emptied so the PATH scan cannot find a codex the developer happens to
+      // have installed.
+      process.env.PATH = '';
+
+      expect(getSelectedProvider()).toBe('claude');
+    });
+
+    // loadFromFile assigns persisted values raw (Record<string, any>) and POST
+    // /api/settings does not coerce them, so a hand-edited `null` reaches
+    // resolveCodexBinary. Unguarded, its .trim() throws a TypeError out of
+    // dispatch — and dispatch is on the path of /api/health and every ingest.
+    it('does not throw when a hand-edited settings.json holds a non-string codex path', () => {
+      const settingsPath = join(process.env.CLAUDE_MEM_DATA_DIR!, 'settings.json');
+      const saved = readFileSync(settingsPath, 'utf-8');
+      try {
+        writeFileSync(settingsPath, JSON.stringify({ ...JSON.parse(saved), CLAUDE_MEM_CODEX_PATH: null }));
+        process.env.CLAUDE_MEM_PROVIDER = 'codex';
+        process.env.CLAUDE_MEM_OPENROUTER_API_KEY = '';
+        process.env.CLAUDE_MEM_GEMINI_API_KEY = '';
+        process.env.PATH = '';
+
+        expect(getSelectedProvider()).toBe('claude');
+        expect(selectProviderForGenerator().provider).toBe('claude');
+      } finally {
+        writeFileSync(settingsPath, saved);
+      }
     });
   });
 

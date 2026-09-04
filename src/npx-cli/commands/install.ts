@@ -861,12 +861,13 @@ function mergeSettings(updates: Record<string, string>): boolean {
   }
 }
 
-type ProviderId = 'claude' | 'gemini' | 'openrouter' | 'host';
+type ProviderId = 'claude' | 'codex' | 'gemini' | 'openrouter' | 'host';
 /**
  * What the installer prompt may offer. `cmem` is a prompt-only sentinel: picking
  * it configures the generic OpenAI-compatible path (base URL + model + key) and
  * persists CLAUDE_MEM_PROVIDER='openrouter'. The worker only understands
- * 'claude' | 'gemini' | 'openrouter', so 'cmem' must never reach settings.json.
+ * 'claude' | 'codex' | 'gemini' | 'openrouter', so 'cmem' must never reach
+ * settings.json.
  */
 type ProviderChoice = ProviderId | 'cmem';
 // Phase 1d: Persisted DB literals (`server_beta_schema_migrations`, job_type
@@ -1055,6 +1056,15 @@ async function promptProvider(
   const initialProvider = (getSetting('CLAUDE_MEM_PROVIDER') as ProviderId) || 'claude';
   const persistedSettings = readPersistedInstallerSettings();
 
+  // A codex install is configured by hand — there is no prompt offering it, and
+  // both arms of the interactive one below call mergeSettings unconditionally.
+  // Without this, simply re-running `claude-mem install` silently moves memory
+  // generation off codex and onto claude or openrouter.
+  if (initialProvider === 'codex' && !options.provider) {
+    log.info('Keeping the existing provider=codex configuration in ~/.claude-mem/settings.json');
+    return 'codex';
+  }
+
   const persistClaudeProvider = (authMethod?: 'subscription' | 'api-key' | 'gateway') => {
     const resolvedAuthMethod = authMethod ?? resolveClaudeAuthMethod();
     const wrote = mergeSettings({
@@ -1153,6 +1163,14 @@ async function promptProvider(
   if (selectedProvider === 'claude') {
     useSubscriptionAuth();
     return 'claude';
+  }
+
+  // `--provider codex` only records the choice: codex authenticates
+  // out-of-band via `codex login`, so there is no key to collect here.
+  if (selectedProvider === 'codex') {
+    const wrote = mergeSettings({ CLAUDE_MEM_PROVIDER: 'codex' });
+    if (wrote) log.info('Saved provider=codex to ~/.claude-mem/settings.json');
+    return 'codex';
   }
 
   if (selectedProvider === 'host') {
@@ -1818,21 +1836,24 @@ async function promptTelemetryOptIn(): Promise<void> {
 /**
  * Whether an install still has an account question to answer.
  *
- * `--provider claude` and `--provider host` are exempt: they either run on the
- * user's own Anthropic plan or the logged-in host agent and need no claude-mem
- * credentials. `gemini` and
+ * `--provider claude`, `--provider codex` and `--provider host` are exempt:
+ * they run on the user's own Anthropic plan, the user's own ChatGPT plan via
+ * `codex login`, or the logged-in host agent, and need no claude-mem
+ * credentials. Demanding a cmem.ai browser OAuth for codex — whose entire
+ * point is that the user's own ChatGPT OAuth is the credential — blocks the
+ * install outright on a headless or account-less machine. `gemini` and
  * `openrouter` are NOT exempt — openrouter is the transport for the cmem
  * gateway, so an explicit `openrouter` install may still be reaching cmem.ai.
  * With no flag at all the provider screen can still offer CMEM Pro, so login
  * must happen first.
  */
 export function providerNeedsAccount(provider: InstallOptions['provider']): boolean {
-  return provider !== 'claude' && provider !== 'host';
+  return provider !== 'claude' && provider !== 'codex' && provider !== 'host';
 }
 
 export interface InstallOptions {
   ide?: string;
-  provider?: 'claude' | 'gemini' | 'openrouter' | 'host';
+  provider?: 'claude' | 'codex' | 'gemini' | 'openrouter' | 'host';
   model?: string;
   noAutoStart?: boolean;
   disableAutoMemory?: boolean;
@@ -2196,7 +2217,9 @@ async function runInstallCommandInner(options: InstallOptions, summary: InstallS
   } else {
     const skipReason = options.provider === 'host'
       ? 'host observer uses the logged-in host agent over a local OpenAI-compatible shim.'
-      : '--provider claude runs memory on your own Anthropic plan.';
+      : options.provider === 'codex'
+        ? '--provider codex runs memory on your own ChatGPT plan via `codex login`.'
+        : '--provider claude runs memory on your own Anthropic plan.';
     log.info(`Skipping claude-mem login: ${skipReason}`);
   }
   const selectedProvider = await promptProvider(options, oauthPairing, version);

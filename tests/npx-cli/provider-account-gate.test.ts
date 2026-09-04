@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { providerNeedsAccount } from '../../src/npx-cli/commands/install.js';
 
 const source = readFileSync(
   join(__dirname, '..', '..', 'src', 'npx-cli', 'commands', 'install.ts'),
@@ -8,8 +9,19 @@ const source = readFileSync(
 );
 
 describe('provider account gate', () => {
-  it('exempts explicit claude and host installs from the account requirement', () => {
-    expect(source).toContain("return provider !== 'claude' && provider !== 'host';");
+  it('exempts explicit claude, codex and host installs from the account requirement', () => {
+    expect(providerNeedsAccount('claude')).toBe(false);
+    // codex authenticates with the user's OWN ChatGPT OAuth via `codex login`;
+    // demanding a cmem.ai browser login for it blocks the install on a
+    // headless or account-less machine.
+    expect(providerNeedsAccount('codex')).toBe(false);
+    expect(providerNeedsAccount('host')).toBe(false);
+  });
+
+  it('still requires an account for gemini, openrouter and an unnamed provider', () => {
+    expect(providerNeedsAccount('gemini')).toBe(true);
+    expect(providerNeedsAccount('openrouter')).toBe(true);
+    expect(providerNeedsAccount(undefined)).toBe(true);
   });
 
   it('still requires an account when no provider was named', () => {
