@@ -80,6 +80,15 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
    */
   protected readonly primesConversation: boolean = true;
 
+  /**
+   * Whether CLAUDE_MEM_TIER_SUMMARY_MODEL may override this provider's model.
+   *
+   * The tier setting names a Claude model, so it is only meaningful for a
+   * provider that can serve one. A provider on another vendor's models opts
+   * out rather than handing its API a model id it will reject.
+   */
+  protected readonly usesTierRouting: boolean = true;
+
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
     this.sessionManager = sessionManager;
@@ -349,7 +358,9 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'summarize';
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const summaryModel = resolveSummaryTierModel(config.model, settings);
+    const summaryModel = this.usesTierRouting
+      ? resolveSummaryTierModel(config.model, settings)
+      : config.model;
     const summaryConfig = summaryModel === config.model ? config : { ...config, model: summaryModel };
     if (summaryConfig !== config) {
       logger.debug('SESSION', 'Tier routing: summary model', {

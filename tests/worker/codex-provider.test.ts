@@ -313,6 +313,7 @@ const mockMode = {
  */
 class StubbedCodexProvider extends CodexProvider {
   readonly sentHistories: ConversationMessage[][] = [];
+  readonly sentModels: string[] = [];
 
   constructor(
     sessionManager: SessionManager,
@@ -325,8 +326,9 @@ class StubbedCodexProvider extends CodexProvider {
     return { apiKey: '/usr/bin/true', model: 'gpt-5.4-mini', reasoningEffort: 'low' };
   }
 
-  protected async query(history: ConversationMessage[]): Promise<ProviderQueryResult> {
+  protected async query(history: ConversationMessage[], config: CodexConfig): Promise<ProviderQueryResult> {
     this.sentHistories.push(history.map((message) => ({ ...message })));
+    this.sentModels.push(config.model);
     return { content: this.replies.shift() ?? '' };
   }
 }
@@ -425,6 +427,31 @@ describe('CodexProvider empty-response handling', () => {
 
   it('reads an empty agent_message as empty content, not as a failure', () => {
     expect(parseCodexJsonl(CODEX_EMPTY_ANSWER_JSONL).content).toBe('');
+  });
+
+  it('never lets the Claude summary tier override the codex model', async () => {
+    // Regression: CLAUDE_MEM_TIER_SUMMARY_MODEL names a Claude model, and codex
+    // rejects it outright — "The 'claude-sonnet-4-6' model is not supported when
+    // using Codex with a ChatGPT account." (400). Every summary failed while
+    // observations, which never consult the tier, succeeded.
+    settingsSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_TIER_ROUTING_ENABLED: 'true',
+      CLAUDE_MEM_TIER_SUMMARY_MODEL: 'claude-sonnet-4-6',
+    }));
+    const manager = {
+      getMessageIterator: async function* () {
+        yield { type: 'summarize', last_user_message: 'done', last_assistant_message: 'ok', prompt_number: 1 };
+      },
+      confirmClaimedMessages: mock(() => Promise.resolve(1)),
+      resetProcessingToPending: mock(() => Promise.resolve(0)),
+    } as unknown as SessionManager;
+    const provider = new StubbedCodexProvider(manager, ['']);
+
+    await provider.startSession(makeSession());
+
+    expect(provider.sentModels).not.toContain('claude-sonnet-4-6');
+    expect(provider.sentModels.every((model) => model === 'gpt-5.4-mini')).toBe(true);
   });
 
   it('raises a transient failure when a clean turn carried no agent_message at all', () => {

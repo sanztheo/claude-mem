@@ -468,6 +468,15 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
    */
   protected readonly primesConversation = false;
 
+  /**
+   * WHY: CLAUDE_MEM_TIER_SUMMARY_MODEL defaults to a Claude model, and codex
+   * rejects those outright — measured: "The 'claude-sonnet-4-6' model is not
+   * supported when using Codex with a ChatGPT account." (400,
+   * invalid_request_error). Every summary failed while observations, which
+   * never consult the tier, succeeded.
+   */
+  protected readonly usesTierRouting = false;
+
   protected getConfig(): CodexConfig {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     return {
